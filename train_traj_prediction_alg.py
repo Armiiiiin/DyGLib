@@ -1,10 +1,20 @@
 """
-DyGFormer traj prediction
+DyGFormer traj prediction with cig alg
 
-1. map fusion
+1. map fusion (ALG)
 2. multi-modal (k traj) 
 3. temporal weighting for loss 
 4. TARGET AGENT only eval
+
+
+V2X-Graph ALG
+
+1. lane_vectors in agent local coord sys
+2. lane_actor_vector = agent to lane relative pos
+3. semantics: intersection, turn dir, traffic
+4. rotation invariance
+5. gate
+
 """
 
 import os
@@ -149,61 +159,136 @@ def create_decoder(embed_dim: int, pred_horizon: int = 30,
     return MLPTrajectoryDecoder(embed_dim, pred_horizon, **kwargs)
 
 
-# > Part 1.5: Map Fusion Modules
+# > Part 1.5: Map Fusion Modules (V2X-Graph ALG Style)
+
 
 class LaneEncoder(nn.Module):
-    """lane centerlines to lane embeddings"""
+    """
+    alg
+    """
     
     def __init__(self, hidden_dim: int = 128, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
         
-        # lane point projection: (x, y) -> hidden_dim
-        self.point_proj = nn.Sequential(
+        self.lane_encoder = nn.Sequential(
             nn.Linear(2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        self.lane_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
         )
         
-    def forward(self, lane_points, lane_mask=None):
+        # > semantic embeddings
+        self.is_intersection_embed = nn.Embedding(2, hidden_dim) 
+        self.turn_direction_embed = nn.Embedding(4, hidden_dim) # > 0 = none, 1 = left, 2 = right, 3 = u turn
+        self.traffic_control_embed = nn.Embedding(2, hidden_dim)
+        
+        self.aggr_embed = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.normal_(self.is_intersection_embed.weight, mean=0., std=0.02)
+        nn.init.normal_(self.turn_direction_embed.weight, mean=0., std=0.02)
+        nn.init.normal_(self.traffic_control_embed.weight, mean=0., std=0.02)
+    
+    def forward(self, lane_vectors, lane_actor_vectors=None, 
+                is_intersections=None, turn_directions=None, traffic_controls=None,
+                lane_mask=None, lane_points=None):
 
-        B, N_lanes, N_points, _ = lane_points.shape
+        # > if only lane points
+        if lane_vectors is None and lane_points is not None:
+            B, N_lanes, N_points, _ = lane_points.shape
+            lane_vectors = lane_points[:, :, -1, :] - lane_points[:, :, 0, :]  # [B, L, 2]
+            lane_actor_vectors = lane_points[:, :, 0, :]  # [B, L, 2]
+            is_intersections = torch.zeros(B, N_lanes, dtype=torch.long, device=lane_points.device)
+            turn_directions = torch.zeros(B, N_lanes, dtype=torch.long, device=lane_points.device)
+            traffic_controls = torch.zeros(B, N_lanes, dtype=torch.long, device=lane_points.device)
         
-        points_flat = lane_points.view(B * N_lanes, N_points, 2)
-        points_h = self.point_proj(points_flat) 
+        # > alg
+        lane_embed = self.lane_encoder(lane_vectors)  # [B, L, D]
         
-        # > self attention within each lane
-        points_h, _ = self.lane_attn(points_h, points_h, points_h)
+        if lane_actor_vectors is not None:
+            edge_embed = self.edge_encoder(lane_actor_vectors)  # [B, L, D]
+        else:
+            edge_embed = torch.zeros_like(lane_embed)
         
-        # > mean pooling to get lane representation
-        lane_embeds = points_h.mean(dim=1) 
-        lane_embeds = lane_embeds.view(B, N_lanes, self.hidden_dim)
+        if is_intersections is not None:
+            is_inter_embed = self.is_intersection_embed(is_intersections.clamp(0, 1))
+        else:
+            is_inter_embed = torch.zeros_like(lane_embed)
+            
+        if turn_directions is not None:
+            turn_dir_embed = self.turn_direction_embed(turn_directions.clamp(0, 3))
+        else:
+            turn_dir_embed = torch.zeros_like(lane_embed)
+            
+        if traffic_controls is not None:
+            traffic_embed = self.traffic_control_embed(traffic_controls.clamp(0, 1))
+        else:
+            traffic_embed = torch.zeros_like(lane_embed)
+        
+        fused = lane_embed + edge_embed + is_inter_embed + turn_dir_embed + traffic_embed
+        
+        lane_embeds = self.aggr_embed(fused) 
         
         return lane_embeds
 
 
 class MapFusionModule(nn.Module):
-    """Fuse agent embedding with lane embeddings"""
+    """
+    1. multi head attention (agent as query, lane as key/value)
+    2. gate
+    3. ffn + residual
+    """
     
     def __init__(self, agent_dim: int, lane_dim: int = 128, 
-                 num_heads: int = 4, dropout: float = 0.1):
+                 num_heads: int = 4, dropout: float = 0.1,
+                 use_gate: bool = True):
         super().__init__()
+        self.use_gate = use_gate
+        self.lane_dim = lane_dim
+        self.num_heads = num_heads
+        self.head_dim = lane_dim // num_heads
         
         self.agent_proj = nn.Linear(agent_dim, lane_dim) if agent_dim != lane_dim else nn.Identity()
         self.output_proj = nn.Linear(lane_dim, agent_dim)
         
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=lane_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
+        # > multi head attention
+        self.lin_q = nn.Linear(lane_dim, lane_dim)
+        self.lin_k = nn.Linear(lane_dim, lane_dim)
+        self.lin_v = nn.Linear(lane_dim, lane_dim)
+        
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+        
+        # > gate
+        if use_gate:
+            self.lin_ih = nn.Linear(lane_dim, lane_dim)
+            self.lin_hh = nn.Linear(lane_dim, lane_dim)
+            self.lin_self = nn.Linear(lane_dim, lane_dim)
+        
+        # > ffn
+        self.norm1 = nn.LayerNorm(lane_dim)
+        self.norm2 = nn.LayerNorm(lane_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(lane_dim, lane_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(lane_dim * 4, lane_dim),
+            nn.Dropout(dropout)
         )
         
     def forward(self, agent_embed, lane_embeds, lane_mask=None):
@@ -211,34 +296,62 @@ class MapFusionModule(nn.Module):
         if lane_mask is None:
             return agent_embed
     
-        has_lanes = lane_mask.any(dim=1)  # check if there's at least 1 lane for each sample
+        has_lanes = lane_mask.any(dim=1)
     
         if not has_lanes.any():
             return agent_embed
     
+        B, L, D = lane_embeds.shape
         fused_embed = agent_embed.clone()
-    
+        
         if has_lanes.all():
-            # > process all
-            agent_h = self.agent_proj(agent_embed).unsqueeze(1)
-            key_padding_mask = ~lane_mask
-            attended, _ = self.cross_attn(
-                agent_h, lane_embeds, lane_embeds,
-                key_padding_mask=key_padding_mask
-            )
-            attended = attended.squeeze(1)
-            fused_embed = self.output_proj(attended) + agent_embed
+            valid_agent = self.agent_proj(agent_embed)
+            valid_lanes = lane_embeds
+            valid_mask = lane_mask
+            valid_idx = None
         else:
-            # > process those with lanes
             valid_idx = has_lanes.nonzero(as_tuple=True)[0]
-            agent_h = self.agent_proj(agent_embed[valid_idx]).unsqueeze(1)
-            key_padding_mask = ~lane_mask[valid_idx]
-            attended, _ = self.cross_attn(
-                agent_h, lane_embeds[valid_idx], lane_embeds[valid_idx],
-                key_padding_mask=key_padding_mask
-            )
-            attended = attended.squeeze(1)
-            fused_embed[valid_idx] = self.output_proj(attended) + agent_embed[valid_idx]
+            valid_agent = self.agent_proj(agent_embed[valid_idx])
+            valid_lanes = lane_embeds[valid_idx]
+            valid_mask = lane_mask[valid_idx]
+        
+        B_valid = valid_agent.size(0)
+        
+        # > multi head attention
+        q = self.lin_q(valid_agent).view(B_valid, 1, self.num_heads, self.head_dim)
+        k = self.lin_k(valid_lanes).view(B_valid, L, self.num_heads, self.head_dim)
+        v = self.lin_v(valid_lanes).view(B_valid, L, self.num_heads, self.head_dim)
+        
+        scale = self.head_dim ** 0.5
+        attn = (q * k).sum(dim=-1) / scale  
+        
+        if valid_mask is not None:
+            attn_mask = ~valid_mask.unsqueeze(-1).expand(-1, -1, self.num_heads)
+            attn = attn.masked_fill(attn_mask, float('-inf'))
+        
+        attn = F.softmax(attn, dim=1)
+        attn = self.attn_drop(attn)
+        
+        attended = (attn.unsqueeze(-1) * v).sum(dim=1).view(B_valid, -1)
+        
+        # > gate
+        if self.use_gate:
+            gate = torch.sigmoid(self.lin_ih(attended) + self.lin_hh(valid_agent))
+            updated = attended + gate * (self.lin_self(valid_agent) - attended)
+        else:
+            updated = attended
+        
+        updated = self.proj_drop(updated)
+        
+        x = valid_agent + updated
+        x = x + self.mlp(self.norm2(x))
+        
+        output = self.output_proj(x)
+        
+        if valid_idx is None:
+            fused_embed = output + agent_embed
+        else:
+            fused_embed[valid_idx] = output + agent_embed[valid_idx]
     
         return fused_embed
 
@@ -630,6 +743,7 @@ class SplitLaneLoader:
     
     def __init__(self, split_data: dict):
         self.has_data = False
+        self.is_alg_style = False
         
         if split_data.get('lane_data') is not None:
             lane_data = split_data['lane_data']
@@ -637,13 +751,61 @@ class SplitLaneLoader:
             self.max_lanes = lane_data['max_lanes']
             self.points_per_lane = lane_data['points_per_lane']
             self.has_data = True
-            print(f"  Lane samples: {len(self.lanes)}")
+            
+            # > if using v2xg alg
+            self.is_alg_style = lane_data.get('style') == 'v2xg-alg'
+            if self.is_alg_style:
+                print(f"  Lane samples: {len(self.lanes)} (V2X-Graph ALG style)")
+            else:
+                print(f"  Lane samples: {len(self.lanes)}")
     
     def get_batch(self, node_ids, timestamps, current_states, device='cpu'):
         B = len(node_ids)
         
         if not self.has_data:
             return None, None
+        
+        if self.is_alg_style:
+            return self._get_batch_alg(node_ids, timestamps, device)
+        else:
+            return self._get_batch_legacy(node_ids, timestamps, current_states, device)
+    
+    def _get_batch_alg(self, node_ids, timestamps, device):
+        B = len(node_ids)
+        
+        lane_vectors = np.zeros((B, self.max_lanes, 2), dtype=np.float32)
+        lane_actor_vectors = np.zeros((B, self.max_lanes, 2), dtype=np.float32)
+        is_intersections = np.zeros((B, self.max_lanes), dtype=np.int64)
+        turn_directions = np.zeros((B, self.max_lanes), dtype=np.int64)
+        traffic_controls = np.zeros((B, self.max_lanes), dtype=np.int64)
+        lane_mask = np.zeros((B, self.max_lanes), dtype=bool)
+        
+        for i, (nid, ts) in enumerate(zip(node_ids, timestamps)):
+            key = (int(nid), float(ts))
+            if key in self.lanes:
+                lanes = self.lanes[key]
+                n_lanes = min(lanes.get('num_lanes', 0), self.max_lanes)
+                
+                if n_lanes > 0:
+                    lane_vectors[i, :n_lanes] = lanes['lane_vectors'][:n_lanes]
+                    lane_actor_vectors[i, :n_lanes] = lanes['lane_actor_vectors'][:n_lanes]
+                    is_intersections[i, :n_lanes] = lanes['is_intersections'][:n_lanes]
+                    turn_directions[i, :n_lanes] = lanes['turn_directions'][:n_lanes]
+                    traffic_controls[i, :n_lanes] = lanes['traffic_controls'][:n_lanes]
+                    lane_mask[i, :n_lanes] = True
+        
+        return {
+            'lane_vectors': torch.from_numpy(lane_vectors).to(device),
+            'lane_actor_vectors': torch.from_numpy(lane_actor_vectors).to(device),
+            'is_intersections': torch.from_numpy(is_intersections).to(device),
+            'turn_directions': torch.from_numpy(turn_directions).to(device),
+            'traffic_controls': torch.from_numpy(traffic_controls).to(device),
+            'lane_mask': torch.from_numpy(lane_mask).to(device)
+        }
+    
+    def _get_batch_legacy(self, node_ids, timestamps, current_states, device):
+        """older version returns centerlines only"""
+        B = len(node_ids)
         
         lane_points = np.zeros((B, self.max_lanes, self.points_per_lane, 2), dtype=np.float32)
         lane_mask = np.zeros((B, self.max_lanes), dtype=bool)
@@ -935,16 +1097,30 @@ def main():
             
                 # > forward map fusion
                 if map_fusion is not None and train_lane_loader is not None:
-                    # get absolute coords for lane lookup
                     abs_current = train_traj_loader.current_state
                     abs_states = np.array([abs_current.get((int(nid), float(ts)), np.zeros(5)) 
                                            for nid, ts in zip(src, times)])
-                    lane_points, lane_mask = train_lane_loader.get_batch(
+                    lane_data = train_lane_loader.get_batch(
                         src, times, abs_states, device=args.device
                     )
-                    if lane_mask is not None and lane_mask.sum() > 0:
-                        lane_embeds = lane_encoder(lane_points, lane_mask)
-                        src_embed = map_fusion(src_embed, lane_embeds, lane_mask)
+                    
+                    if isinstance(lane_data, dict):
+                        lane_mask = lane_data['lane_mask']
+                        if lane_mask.sum() > 0:
+                            lane_embeds = lane_encoder(
+                                lane_vectors=lane_data['lane_vectors'],
+                                lane_actor_vectors=lane_data['lane_actor_vectors'],
+                                is_intersections=lane_data['is_intersections'],
+                                turn_directions=lane_data['turn_directions'],
+                                traffic_controls=lane_data['traffic_controls'],
+                                lane_mask=lane_mask
+                            )
+                            src_embed = map_fusion(src_embed, lane_embeds, lane_mask)
+                    else:
+                        lane_points, lane_mask = lane_data
+                        if lane_mask is not None and lane_mask.sum() > 0:
+                            lane_embeds = lane_encoder(lane_points=lane_points, lane_mask=lane_mask)
+                            src_embed = map_fusion(src_embed, lane_embeds, lane_mask)
             
                 # > forward decoder
                 output = decoder(src_embed, current, history_traj=history)
@@ -1022,12 +1198,27 @@ def main():
                             abs_current = val_traj_loader.current_state
                             abs_states = np.array([abs_current.get((int(nid), float(ts)), np.zeros(5)) 
                                                    for nid, ts in zip(src, times)])
-                            lane_points, lane_mask = val_lane_loader.get_batch(
+                            lane_data = val_lane_loader.get_batch(
                                 src, times, abs_states, device=args.device
                             )
-                            if lane_mask is not None and lane_mask.sum() > 0:
-                                lane_embeds = lane_encoder(lane_points, lane_mask)
-                                src_embed = map_fusion(src_embed, lane_embeds, lane_mask)
+                            
+                            if isinstance(lane_data, dict):
+                                lane_mask = lane_data['lane_mask']
+                                if lane_mask.sum() > 0:
+                                    lane_embeds = lane_encoder(
+                                        lane_vectors=lane_data['lane_vectors'],
+                                        lane_actor_vectors=lane_data['lane_actor_vectors'],
+                                        is_intersections=lane_data['is_intersections'],
+                                        turn_directions=lane_data['turn_directions'],
+                                        traffic_controls=lane_data['traffic_controls'],
+                                        lane_mask=lane_mask
+                                    )
+                                    src_embed = map_fusion(src_embed, lane_embeds, lane_mask)
+                            else:
+                                lane_points, lane_mask = lane_data
+                                if lane_mask is not None and lane_mask.sum() > 0:
+                                    lane_embeds = lane_encoder(lane_points=lane_points, lane_mask=lane_mask)
+                                    src_embed = map_fusion(src_embed, lane_embeds, lane_mask)
                     
                         output = decoder(src_embed, current, history_traj=history)
                     
@@ -1202,13 +1393,27 @@ def main():
                         abs_current = test_traj_loader.current_state
                         abs_states = np.array([abs_current.get((int(nid), float(ts)), np.zeros(5))
                                                for nid, ts in zip(batch_node_ids, batch_times)])
-                        lane_points, lane_mask = test_lane_loader.get_batch(
+                        lane_data = test_lane_loader.get_batch(
                             batch_node_ids, batch_times, abs_states, device=args.device
                         )
                         
-                        if lane_mask is not None and lane_mask.sum() > 0:
-                            lane_embeds = lane_encoder(lane_points, lane_mask)
-                            batch_embeds = map_fusion(batch_embeds, lane_embeds, lane_mask)
+                        if isinstance(lane_data, dict):
+                            lane_mask = lane_data['lane_mask']
+                            if lane_mask.sum() > 0:
+                                lane_embeds = lane_encoder(
+                                    lane_vectors=lane_data['lane_vectors'],
+                                    lane_actor_vectors=lane_data['lane_actor_vectors'],
+                                    is_intersections=lane_data['is_intersections'],
+                                    turn_directions=lane_data['turn_directions'],
+                                    traffic_controls=lane_data['traffic_controls'],
+                                    lane_mask=lane_mask
+                                )
+                                batch_embeds = map_fusion(batch_embeds, lane_embeds, lane_mask)
+                        else:
+                            lane_points, lane_mask = lane_data
+                            if lane_mask is not None and lane_mask.sum() > 0:
+                                lane_embeds = lane_encoder(lane_points=lane_points, lane_mask=lane_mask)
+                                batch_embeds = map_fusion(batch_embeds, lane_embeds, lane_mask)
 
                 
                     output = decoder(batch_embeds, current, history_traj=history)

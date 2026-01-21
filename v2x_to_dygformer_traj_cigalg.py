@@ -2,10 +2,23 @@
 V2X-Seq-TFD to DyGFormer format converter for traj prediction
 input: V2X-Seq-TFD cooperative-trajectories (fused vehicle + infra)
 
+V2X-Graph CIG 
+
+1. directed edges src -> dst and dst -> src are 2 seperate adges
+2. local coord of TARGET node
+3. relative pos = src_pos - dst_pos
+4. relative heading = src_heading - dst_heading
+
+V2X-Graph ALG
+
+1. lane_vectors in agent local coord sys
+2. lane_actor_vector = agent to lane relative pos
+3. semantics: intersection, turn dir, traffic
+4. rotation invariance
+
 V2X train 80% -> my train
 V2X train 20% -> my val
 V2X val 100% -> my test
-for car with speed < 0.5 m/s, future_traj (x, y) = (x0, y0), that way the relative coord can be (0, 0) and the noise can be reduced
 """
 
 import numpy as np
@@ -56,7 +69,16 @@ class V2XToDyGFormerTrajectory:
         self.has_lane_map = True
         print(f"  Loaded {len(self.lane_bbox)} lanes")
     
-    def get_nearby_lanes(self, x: float, y: float) -> dict:
+    def get_nearby_lanes(self, x: float, y: float, heading: float = 0.0) -> dict:
+        """
+        V2X-Graph ALG
+
+        1. lane_vectors in agent local coord sys
+        2. lane_actor_vector = agent to lane relative pos
+        3. semantics: intersection, turn dir, traffic
+        4. rotation invariance
+        
+        """
         if not self.has_lane_map:
             return None
         
@@ -70,8 +92,21 @@ class V2XToDyGFormerTrajectory:
         if len(candidate_indices) == 0:
             return None
         
-        centerlines = []
-        lane_types = []
+        # > agent rotation
+        cos_h = np.cos(heading)
+        sin_h = np.sin(heading)
+        
+        TURN_DIR_MAP = {
+            'NONE': 0, 'STRAIGHT': 0, '': 0, None: 0,
+            'LEFT': 1, 'RIGHT': 2, 'U_TURN': 3, 'UTURN': 3
+        }
+        
+        lane_vectors_list = [] # > lane dir in agent's local coord sys
+        lane_positions_list = [] # > lane start point in global
+        is_intersections_list = [] 
+        turn_directions_list = []
+        traffic_controls_list = [] 
+        centerlines_list = [] # > center line in local
         distances = []
         
         for idx in candidate_indices:
@@ -82,7 +117,7 @@ class V2XToDyGFormerTrajectory:
             lane_info = self.vector_map[lane_id]
             centerline = np.array(lane_info['centerline'])
             
-            if len(centerline) == 0:
+            if len(centerline) < 2:
                 continue
             
             dists = np.sqrt((centerline[:, 0] - x)**2 + (centerline[:, 1] - y)**2)
@@ -91,6 +126,23 @@ class V2XToDyGFormerTrajectory:
             if min_dist > self.lane_search_radius:
                 continue
             
+            # > dir vec
+            vectors = centerline[1:] - centerline[:-1]
+            avg_vector = vectors.mean(axis=0)
+            # < convert to local
+            lane_vec_x = cos_h * avg_vector[0] + sin_h * avg_vector[1]
+            lane_vec_y = -sin_h * avg_vector[0] + cos_h * avg_vector[1]
+            
+            # > nearest to lane
+            nearest_idx = dists.argmin()
+            lane_pos = centerline[nearest_idx]
+            
+            is_intersection = 1 if lane_info.get('is_intersection', False) else 0
+            turn_dir_raw = str(lane_info.get('turn_direction', 'NONE')).upper()
+            turn_direction = TURN_DIR_MAP.get(turn_dir_raw, 0)
+            traffic_control = 1 if lane_info.get('has_traffic_control', False) else 0
+            
+            # > centerline to local
             if len(centerline) >= self.points_per_lane:
                 indices = np.linspace(0, len(centerline)-1, self.points_per_lane, dtype=int)
                 sampled = centerline[indices]
@@ -99,20 +151,46 @@ class V2XToDyGFormerTrajectory:
                 sampled[:len(centerline)] = centerline
                 sampled[len(centerline):] = centerline[-1]
             
-            centerlines.append(sampled)
-            lane_types.append(lane_info.get('lane_type', 'UNKNOWN'))
+            rel_centerline = sampled - np.array([x, y])
+            sampled_local_x = cos_h * rel_centerline[:, 0] + sin_h * rel_centerline[:, 1]
+            sampled_local_y = -sin_h * rel_centerline[:, 0] + cos_h * rel_centerline[:, 1]
+            sampled_local = np.stack([sampled_local_x, sampled_local_y], axis=1)
+            
+            lane_vectors_list.append([lane_vec_x, lane_vec_y])
+            lane_positions_list.append(lane_pos)
+            is_intersections_list.append(is_intersection)
+            turn_directions_list.append(turn_direction)
+            traffic_controls_list.append(traffic_control)
+            centerlines_list.append(sampled_local)
             distances.append(min_dist)
         
-        if len(centerlines) == 0:
+        if len(lane_vectors_list) == 0:
             return None
         
         sorted_idx = np.argsort(distances)[:self.max_lanes]
-        centerlines = np.array([centerlines[i] for i in sorted_idx])
-        lane_types = [lane_types[i] for i in sorted_idx]
+        
+        lane_vectors = np.array([lane_vectors_list[i] for i in sorted_idx], dtype=np.float32)
+        lane_positions = np.array([lane_positions_list[i] for i in sorted_idx], dtype=np.float32)
+        is_intersections = np.array([is_intersections_list[i] for i in sorted_idx], dtype=np.int64)
+        turn_directions = np.array([turn_directions_list[i] for i in sorted_idx], dtype=np.int64)
+        traffic_controls = np.array([traffic_controls_list[i] for i in sorted_idx], dtype=np.int64)
+        centerlines = np.array([centerlines_list[i] for i in sorted_idx], dtype=np.float32)
+        
+        rel_x_world = lane_positions[:, 0] - x
+        rel_y_world = lane_positions[:, 1] - y
+        lane_actor_x = cos_h * rel_x_world + sin_h * rel_y_world
+        lane_actor_y = -sin_h * rel_x_world + cos_h * rel_y_world
+        lane_actor_vectors = np.stack([lane_actor_x, lane_actor_y], axis=1).astype(np.float32)
         
         return {
-            'centerlines': centerlines.astype(np.float32),
-            'lane_types': lane_types
+            'lane_vectors': lane_vectors, # > lane dir
+            'lane_actor_vectors': lane_actor_vectors, # > agent to lane
+            'is_intersections': is_intersections,
+            'turn_directions': turn_directions,
+            'traffic_controls': traffic_controls, 
+
+            'centerlines': centerlines, 
+            'num_lanes': len(lane_vectors)
         }
     
     def load_trajectory_file(self, csv_file: Path) -> pd.DataFrame:
@@ -286,7 +364,9 @@ class V2XToDyGFormerTrajectory:
                     
                     nearby_lanes = None
                     if self.has_lane_map:
-                        nearby_lanes = self.get_nearby_lanes(row['x'], row['y'])
+                        nearby_lanes = self.get_nearby_lanes(
+                            row['x'], row['y'], row.get('heading', 0)
+                        )
                     is_target = (row.get('tag', '') == 'TARGET_AGENT')
                     
                     agents.append({
@@ -339,57 +419,75 @@ class V2XToDyGFormerTrajectory:
                 
                 agents = valid_agents
                 
-                for i, agent_i in enumerate(agents):
-                    for j, agent_j in enumerate(agents[i+1:], i+1):
-                        dist = np.sqrt((agent_i['x'] - agent_j['x'])**2 + (agent_i['y'] - agent_j['y'])**2)
+                # > V2X-Graph CIG
+                for src_idx, src_agent in enumerate(agents):
+                    for dst_idx, dst_agent in enumerate(agents):
+                        if src_idx == dst_idx:
+                            continue
+                        
+                        dist = np.sqrt((src_agent['x'] - dst_agent['x'])**2 + 
+                                      (src_agent['y'] - dst_agent['y'])**2)
                         
                         if dist < spatial_threshold:
                             edge_idx += 1
                             
-                            # > relative to agent i's heading
-                            heading_i = agent_i['heading']
-                            cos_h = np.cos(heading_i)
-                            sin_h = np.sin(heading_i)
+                            # > coord system: dst heading
+                            heading_dst = dst_agent['heading']
+                            cos_h = np.cos(heading_dst)
+                            sin_h = np.sin(heading_dst)
                             
-                            # > relative position in agent i local frame
-                            dx = agent_j['x'] - agent_i['x']
-                            dy = agent_j['y'] - agent_i['y']
+                            # > relative pos: src - dst
+                            dx = src_agent['x'] - dst_agent['x']
+                            dy = src_agent['y'] - dst_agent['y']
+                            
+                            # > dst agent coord
                             rel_x = cos_h * dx + sin_h * dy
                             rel_y = -sin_h * dx + cos_h * dy
                             
-                            # > angle in agent i local frame
-                            angle_local = np.arctan2(rel_y, rel_x)
+                            # > angle in dst agent coord
+                            angle_in_dst_frame = np.arctan2(rel_y, rel_x)
                             
-                            # > transform v to local frame 
-                            vi_x_local = cos_h * agent_i['vx'] + sin_h * agent_i['vy']
-                            vi_y_local = -sin_h * agent_i['vx'] + cos_h * agent_i['vy']
-                            vj_x_local = cos_h * agent_j['vx'] + sin_h * agent_j['vy']
-                            vj_y_local = -sin_h * agent_j['vx'] + cos_h * agent_j['vy']
+                            # > src_v converted into dst node coord
+                            src_vx_local = cos_h * src_agent['vx'] + sin_h * src_agent['vy']
+                            src_vy_local = -sin_h * src_agent['vx'] + cos_h * src_agent['vy']
                             
-                            # > relative v in local frame
-                            rel_vx = vj_x_local - vi_x_local
-                            rel_vy = vj_y_local - vi_y_local
+                            # > dst_v in dst coord system
+                            dst_vx_local = cos_h * dst_agent['vx'] + sin_h * dst_agent['vy']
+                            dst_vy_local = -sin_h * dst_agent['vx'] + cos_h * dst_agent['vy']
+                            
+                            # > relative v in dst coord system
+                            rel_vx = src_vx_local - dst_vx_local
+                            rel_vy = src_vy_local - dst_vy_local
+                            
+                            # > relative heading = src_heading - dst_heading
+                            heading_diff = src_agent['heading'] - dst_agent['heading']
+                            heading_diff = np.arctan2(np.sin(heading_diff), np.cos(heading_diff))
                             
                             all_edges.append({
-                                'u': agent_i['node_id'],
-                                'i': agent_j['node_id'],
+                                'u': src_agent['node_id'],  
+                                'i': dst_agent['node_id'],  
                                 'ts': normalized_ts,
                                 'label': 1,
                                 'idx': edge_idx
                             })
                             
                             edge_feat = [
-                                dist, angle_local, # > distance, angle in agent i local frame
-                                vi_x_local, vi_y_local, # > v in agent i local frame
-                                vj_x_local, vj_y_local, # > agent j v in local frame
-                                rel_vx, rel_vy, # > relative v in local frame
-                                0.0, 0.0, 0.0, 0.0, 0.0,
-                                1.0 if agent_i['type'] == agent_j['type'] else 0.0
+                                dist,
+                                angle_in_dst_frame, # > src angle in dst coord sys
+                                src_vx_local, src_vy_local,     
+                                dst_vx_local, dst_vy_local, 
+                                rel_vx, rel_vy,
+                                np.cos(heading_diff), # > relative heading cos
+                                np.sin(heading_diff), # > relative heading sin
+                                dist / spatial_threshold, # > normalized dist
+                                np.sqrt(rel_vx**2 + rel_vy**2), # > scalar
+                                1.0 if np.cos(heading_diff) > 0.5 else 0.0,  # > sae heading flag
+                                1.0 if src_agent['type'] == dst_agent['type'] else 0.0 
                             ]
                             all_edge_feats.append(edge_feat)
             
             if (scene_idx + 1) % 100 == 0:
-                print(f"  Processed {scene_idx + 1}/{len(scene_files)} scenes...")
+                print(f"  Processed {scene_idx + 1}/{len(scene_files)} scenes")
         
         print(f"\n{split_name} Summary:")
         print(f"  Total nodes: {len(node_id_map)}")
@@ -452,7 +550,16 @@ class V2XToDyGFormerTrajectory:
                 'lanes': data['node_lanes'],
                 'max_lanes': self.max_lanes,
                 'points_per_lane': self.points_per_lane,
-                'search_radius': self.lane_search_radius
+                'search_radius': self.lane_search_radius,
+                'style': 'v2xg-alg',
+                'fields': [
+                    'lane_vectors', 
+                    'lane_actor_vectors'
+                    'is_intersections', 
+                    'turn_directions',
+                    'traffic_controls',  
+                    'centerlines', 
+                ]
             }
             with open(self.output_dir / f'{split_name}_lanes.pkl', 'wb') as f:
                 pickle.dump(lane_data, f)
@@ -465,7 +572,7 @@ if __name__ == "__main__":
     
     V2X_ROOT = "/scratch/maiqi/autodriving/v2xseq/V2X-Seq-TFD"
     
-    OUTPUT_DIR = "/scratch/yiran/v2x/v2x_rot"
+    OUTPUT_DIR = "/scratch/yiran/v2x/v2x_cig_alg"
     
     converter = V2XToDyGFormerTrajectory(v2x_root=V2X_ROOT, output_dir=OUTPUT_DIR)
     converter.has_lane_map = True
@@ -582,7 +689,20 @@ if __name__ == "__main__":
         'train_size': len(my_train_files),
         'val_size': len(my_val_files),
         'test_size': len(all_test_files),
-        'data_source': 'cooperative-trajectories'
+        'data_source': 'cooperative-trajectories',
+        'graph_style': 'v2xg-cig-directed-dst-centric',
+        'edge_features': [
+            'distance',
+            'angle_in_dst_frame',
+            'src_vx_local', 'src_vy_local',
+            'dst_vx_local', 'dst_vy_local',
+            'rel_vx', 'rel_vy',
+            'rel_heading_cos', 'rel_heading_sin',
+            'normalized_distance',
+            'rel_speed',
+            'same_direction_flag',
+            'same_type_flag'
+        ]
     }
     with open(converter.output_dir / 'split_info.json', 'w') as f:
         json.dump(split_info, f, indent=2)
