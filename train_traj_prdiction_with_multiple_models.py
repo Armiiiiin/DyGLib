@@ -350,18 +350,15 @@ def create_decoder(embed_dim: int, pred_horizon: int = 30,
 def get_embeddings(encoder, src, dst, times, edge_ids=None, 
                   history=None, current=None, needs_edge_ids=False, needs_history=False):
     """Unified function to get embeddings for any encoder type"""
+    kwargs = {}
+    if needs_history:
+        kwargs['history_traj'] = history
+        kwargs['current_state'] = current
+
     if needs_edge_ids:
-        return encoder.compute_src_dst_node_temporal_embeddings(
-            src, dst, times, edge_ids,
-            history_traj=history if needs_history else None,
-            current_state=current if needs_history else None
-        )
+        return encoder.compute_src_dst_node_temporal_embeddings(src, dst, times, edge_ids, **kwargs)
     else:
-        return encoder.compute_src_dst_node_temporal_embeddings(
-            src, dst, times,
-            history_traj=history if needs_history else None,
-            current_state=current if needs_history else None
-        )
+        return encoder.compute_src_dst_node_temporal_embeddings(src, dst, times, **kwargs)
 # > Part 1.5: Map Fusion Modules (V2X-Graph ALG Style)
 
 
@@ -1436,17 +1433,18 @@ def main():
                 
             
                 # > forward encoder
+                enc_kwargs = {}
+                if needs_history:
+                    enc_kwargs['history_traj'] = history
+                    enc_kwargs['current_state'] = current
+
                 if needs_edge_ids:
                     src_embed, _ = encoder.compute_src_dst_node_temporal_embeddings(
-                        src, dst, times, edge_ids,
-                        history_traj=history if needs_history else None,
-                        current_state=current if needs_history else None
+                        src, dst, times, edge_ids, **enc_kwargs
                     )
                 else:
                     src_embed, _ = encoder.compute_src_dst_node_temporal_embeddings(
-                        src, dst, times,
-                        history_traj=history if needs_history else None,
-                        current_state=current if needs_history else None
+                        src, dst, times, **enc_kwargs
                     )
                 if batch_idx == 0 and epoch == 0:
                     print(f"First batch - history shape: {history.shape}")
@@ -1558,17 +1556,18 @@ def main():
                         gt_traj = traj_batch['future_traj'][valid].to(args.device)
                         history = traj_batch['history_traj'][valid].to(args.device)
                     
+                        enc_kwargs = {}
+                        if needs_history:
+                            enc_kwargs['history_traj'] = history
+                            enc_kwargs['current_state'] = current
+
                         if needs_edge_ids:
                             src_embed, _ = encoder.compute_src_dst_node_temporal_embeddings(
-                                src, dst, times, edge_ids,
-                                history_traj=history if needs_history else None,
-                                current_state=current if needs_history else None
+                                src, dst, times, edge_ids, **enc_kwargs
                             )
                         else:
                             src_embed, _ = encoder.compute_src_dst_node_temporal_embeddings(
-                                src, dst, times,
-                                history_traj=history if needs_history else None,
-                                current_state=current if needs_history else None
+                                src, dst, times, **enc_kwargs
                             )
                     
                         # > map fusion
